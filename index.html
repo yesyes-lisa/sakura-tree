@@ -4,6 +4,15 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>🌸 樱花林场景</title>
+    <!-- 修复 three 模块导入报错的 importmap -->
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+    </script>
     <style>
         * {
             margin: 0;
@@ -24,6 +33,5 @@
 <body>
     <div id="app"></div>
     <script type="module" src="./src/main.js"></script>
-    <!-- 改成 ./src/main.js -->
 </body>
 </html>
