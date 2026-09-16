@@ -19,7 +19,7 @@ app.appendChild(renderer.domElement)
 // 共享模式状态
 const state = { mode: 'real' }
 
-// ========== 现实版场景（当前样式，天空加了一点蓝） ==========
+// ========== 现实版场景 ==========
 function setupReal() {
   const scene = new THREE.Scene()
   const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 0.1, 300)
@@ -35,25 +35,31 @@ function setupReal() {
 
   // ========== 光照 ==========
   const sun = new THREE.DirectionalLight(0xffffff, 0.9)
-  sun.position.set(100, 40, -60); sun.castShadow = true
+  sun.position.set(100, 85, -60); sun.castShadow = true
   sun.shadow.mapSize.set(2048,2048); sun.shadow.camera.near=0.5; sun.shadow.camera.far=200
-  sun.shadow.camera.left=-80; sun.shadow.camera.right=80; sun.shadow.camera.top=80; sun.shadow.camera.bottom=-80
+  sun.shadow.camera.left=-140; sun.shadow.camera.right=140; sun.shadow.camera.top=140; sun.shadow.camera.bottom=-140
+  sun.shadow.bias = -0.00015; sun.shadow.normalBias = 0.025
   scene.add(sun)
-  scene.add(new THREE.AmbientLight(0xffffff, 0.4))
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x8890a8, 0.25))
+  const ambient = new THREE.AmbientLight(0xffffff, 0.4)
+  const hemisphere = new THREE.HemisphereLight(0xffffff, 0x8890a8, 0.25)
+  scene.add(ambient)
+  scene.add(hemisphere)
 
   // ========== 天空（真实感大气渐变 + 太阳光晕，单次着色器绘制） ==========
   const skyGeo = new THREE.SphereGeometry(200, 64, 32)
-  const skySunDir = new THREE.Vector3(0, 20, -140).normalize()
+  const skySunDir = new THREE.Vector3(0, 0.65, -1).normalize()
   const skyMat = new THREE.ShaderMaterial({
     side: THREE.BackSide,
     depthWrite: false,
     uniforms: {
-      uZenith: { value: new THREE.Color(0x1e5aa8) },   // 天顶深蓝
-      uMid:    { value: new THREE.Color(0x7fb2e0) },   // 中段浅蓝
-      uHorizon:{ value: new THREE.Color(0xd4e3f2) },   // 地平线浅蓝白（自然）
+      uZenith: { value: new THREE.Color(0x164b91) },   // 天顶深蓝
+      uMid:    { value: new THREE.Color(0x6fa9dc) },   // 中段天空蓝
+      uHorizon:{ value: new THREE.Color(0xe7eef5) },   // 地平线雾白
       uSunDir: { value: skySunDir },
       uOff:    { value: 26.0 },
+      uSunStrength: { value: 1.0 },
+      uCloudTint: { value: new THREE.Color(0xf5f8ff) },
+      uCloudStrength: { value: 0.12 },
     },
     vertexShader: `
       varying vec3 vW;
@@ -65,23 +71,48 @@ function setupReal() {
     `,
     fragmentShader: `
       uniform vec3 uZenith, uMid, uHorizon, uSunDir;
-      uniform float uOff;
+      uniform float uOff, uSunStrength, uCloudStrength;
+      uniform vec3 uCloudTint;
       varying vec3 vW;
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+      }
+      float noise(vec2 p) {
+        vec2 i = floor(p), f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+      }
+      float fbm(vec2 p) {
+        float value = 0.0, amplitude = 0.5;
+        for (int i = 0; i < 5; i++) {
+          value += noise(p) * amplitude;
+          p = p * 2.03 + vec2(17.2, 9.4);
+          amplitude *= 0.5;
+        }
+        return value;
+      }
       void main(){
         vec3 w = normalize(vW + vec3(0.0, uOff, 0.0));
         float h = clamp(w.y, 0.0, 1.0);
-        // 大气散射式三段渐变：地平线暖白 -> 中段浅蓝 -> 天顶深蓝
-        float t = pow(h, 0.6);
+        // 用高度和视线角模拟真实天空的瑞利散射层次。
+        float t = pow(h, 0.55);
         vec3 col = mix(uHorizon, uMid, smoothstep(0.0, 0.4, t));
         col = mix(col, uZenith, smoothstep(0.4, 1.0, t));
-        // 地平线附近淡淡的暖色大气光晕
-        col += uHorizon * pow(1.0 - h, 3.0) * 0.18;
-        // 太阳：小亮核 + 柔和内晕 + 外晕
+        // 地平线的空气透视会变亮，并带一点暖色散射。
+        col += vec3(1.0, 0.93, 0.82) * pow(1.0 - h, 4.0) * 0.08;
+        // 高空薄云：拉伸的低对比度纹理，只改变天空颜色，不制造体积云。
+        vec2 cloudUv = vec2(w.x * 3.6 + w.z * 1.4, w.z * 0.9 - w.x * 0.5);
+        float cloudNoise = fbm(cloudUv + vec2(h * 2.0, h * 0.7));
+        float cloudBand = smoothstep(0.12, 0.28, h) * (1.0 - smoothstep(0.72, 0.9, h));
+        float cloudShape = smoothstep(0.53, 0.72, cloudNoise) * cloudBand;
+        col = mix(col, uCloudTint, cloudShape * uCloudStrength);
+        // 太阳：亮核、内晕和较宽的柔和外晕。
         float sun = max(dot(w, uSunDir), 0.0);
-        float disc = smoothstep(0.9992, 0.9995, sun);
-        col += vec3(1.0, 0.97, 0.90) * disc * 1.5;
-        col += vec3(1.0, 0.86, 0.62) * pow(sun, 12.0) * 0.35;
-        col += vec3(1.0, 0.75, 0.50) * pow(sun, 4.0)  * 0.16;
+        float disc = smoothstep(0.997, 0.9994, sun);
+        col += vec3(1.0, 0.98, 0.92) * disc * 1.35 * uSunStrength;
+        col += vec3(1.0, 0.88, 0.68) * pow(sun, 18.0) * 0.24 * uSunStrength;
+        col += vec3(1.0, 0.78, 0.56) * pow(sun, 5.0)  * 0.10 * uSunStrength;
+        col += vec3(1.0, 0.58, 0.32) * pow(sun, 2.2) * 0.035 * uSunStrength;
         gl_FragColor = vec4(col, 1.0);
       }
     `,
@@ -89,6 +120,23 @@ function setupReal() {
   const skyMesh = new THREE.Mesh(skyGeo, skyMat)
   skyMesh.frustumCulled = false
   scene.add(skyMesh)
+
+  // 夜晚星空：远处的细小冷白星点，不参与场景深度遮挡。
+  const starCount = 420
+  const starPositions = new Float32Array(starCount * 3)
+  for (let i = 0; i < starCount; i++) {
+    const angle = Math.random() * Math.PI * 2
+    const height = 0.12 + Math.random() * 0.82
+    const radius = 170
+    starPositions[i * 3] = Math.cos(angle) * radius * (0.7 + Math.random() * 0.3)
+    starPositions[i * 3 + 1] = height * radius
+    starPositions[i * 3 + 2] = -Math.abs(Math.sin(angle) * radius) - 35
+  }
+  const starGeometry = new THREE.BufferGeometry()
+  starGeometry.setAttribute('position', new THREE.BufferAttribute(starPositions, 3))
+  const stars = new THREE.Points(starGeometry, new THREE.PointsMaterial({ color: 0xdbe8ff, size: 0.7, transparent: true, opacity: 0, depthWrite: false, sizeAttenuation: false }))
+  stars.frustumCulled = false
+  scene.add(stars)
 
   // ========== 雪地（程序化生成：亮白雪堆起伏 + 微闪 + 法线） ==========
   function makeSnowGround() {
@@ -239,7 +287,7 @@ function setupReal() {
     snowPos[i*3]   = (Math.random() - 0.5) * 140
     snowPos[i*3+1] = Math.random() * 45
     snowPos[i*3+2] = (Math.random() - 0.5) * 140
-    snowSpd[i] = 0.04 + Math.random() * 0.08
+    snowSpd[i] = 0.055 + Math.random() * 0.10
   }
   snowGeo.setAttribute('position', new THREE.BufferAttribute(snowPos, 3))
 
@@ -254,8 +302,8 @@ function setupReal() {
   sctx.fillRect(0, 0, 32, 32)
 
   const snowPoints = new THREE.Points(snowGeo, new THREE.PointsMaterial({
-    color: 0xffffff, size: 0.4, map: new THREE.CanvasTexture(snowCanvas),
-    transparent: true, opacity: 0.85, depthWrite: false, sizeAttenuation: true
+    color: 0xffffff, size: 0.52, map: new THREE.CanvasTexture(snowCanvas),
+    transparent: true, opacity: 0.95, depthWrite: false, sizeAttenuation: true
   }))
   snowPoints.frustumCulled = false
   scene.add(snowPoints)
@@ -362,30 +410,11 @@ function setupReal() {
     renderer.domElement.style.cursor=hit?'pointer':'grab'
   })
 
-  // ========== 雲層 ==========
-  const cloudList=[]
-  const cMat=new THREE.MeshStandardMaterial({color:0xf0e8e0,transparent:true,opacity:.5,roughness:1})
-  const cdMat=new THREE.MeshStandardMaterial({color:0xe0d0c0,transparent:true,opacity:.3,roughness:1})
-  function createClouds(){
-    for(let i=0;i<12;i++){
-      const g=new THREE.Group()
-      for(let j=0;j<6+Math.floor(Math.random()*8);j++){
-        const c=new THREE.Mesh(new THREE.BoxGeometry(1+Math.random()*2,.6+Math.random()*1,1+Math.random()*2),Math.random()>.6?cdMat:cMat)
-        c.position.set((Math.random()-.5)*5,(Math.random()-.5)*2,(Math.random()-.5)*5)
-        g.add(c)
-      }
-      g.position.set((Math.random()-.5)*160,20+Math.random()*30,-70-Math.random()*60)
-      g.userData={bx:g.position.x,sp:.001+Math.random()*.003,rn:4+Math.random()*8}
-      scene.add(g); cloudList.push(g)
-    }
-  }
-  function updateClouds(t){cloudList.forEach(c=>{c.position.x=c.userData.bx+Math.sin(t*.015*c.userData.sp)*c.userData.rn})}
-
   // ========== 初始化 ==========
-  loadTrees(); loadGrass(); createSnowmen(); createClouds()
+  loadTrees(); loadGrass(); createSnowmen()
 
   function update(dt, frame){
-    updateSnow(dt); updateClouds(frame)
+    updateSnow(dt)
     if(weatherOn){ wind = 2.5 } else { wind = Math.max(0, wind - dt*0.6) }
     if(window.treeMixers)window.treeMixers.forEach(m=>m.update(dt))
     if(window.grassMixers)window.grassMixers.forEach(m=>m.update(dt))
@@ -414,7 +443,7 @@ function setupReal() {
   function toggleWeather(){
     weatherOn = !weatherOn
     if(weatherOn){
-      snowTarget = 900
+      snowTarget = 1650
       wind = 2.5
     } else {
       snowTarget = 0
@@ -423,44 +452,103 @@ function setupReal() {
     snowmen.forEach(s=>s.userData.target=s.userData.base*(weatherOn?1.06:1))
   }
 
-  return { camera, target, update, render, resize, toggleWeather, gust }
+  const timeNames = ['白天', '黄昏', '夜晚']
+  let timeIndex = 0
+  function setTime(next = (timeIndex + 1) % timeNames.length) {
+    timeIndex = next
+    if (timeIndex === 0) {
+      skyMat.uniforms.uZenith.value.set(0x164b91)
+      skyMat.uniforms.uMid.value.set(0x6fa9dc)
+      skyMat.uniforms.uHorizon.value.set(0xe7eef5)
+      skyMat.uniforms.uSunStrength.value = 1
+      skySunDir.set(0, 0.65, -1).normalize()
+      sun.position.set(100, 85, -60)
+      sun.color.set(0xffffff); sun.intensity = 0.9
+      ambient.color.set(0xffffff); ambient.intensity = 0.4
+      hemisphere.color.set(0xffffff); hemisphere.groundColor.set(0x8890a8); hemisphere.intensity = 0.25
+      snowGround.material.color.set(0xffffff)
+      skyMat.uniforms.uCloudTint.value.set(0xf5f8ff); skyMat.uniforms.uCloudStrength.value = 0.12
+      stars.material.opacity = 0
+      bloom.strength = 0.08
+    } else if (timeIndex === 1) {
+      skyMat.uniforms.uZenith.value.set(0x53628f)
+      skyMat.uniforms.uMid.value.set(0xd18778)
+      skyMat.uniforms.uHorizon.value.set(0xffc47a)
+      skyMat.uniforms.uSunStrength.value = 1.35
+      skySunDir.set(-0.65, 0.14, -0.75).normalize()
+      sun.position.set(-100, 38, -110)
+      sun.color.set(0xffbc78); sun.intensity = 1.18
+      ambient.color.set(0xf0b08e); ambient.intensity = 0.3
+      hemisphere.color.set(0xffd09b); hemisphere.groundColor.set(0x635068); hemisphere.intensity = 0.24
+      snowGround.material.color.set(0xffe0bd)
+      skyMat.uniforms.uCloudTint.value.set(0xffdfbd); skyMat.uniforms.uCloudStrength.value = 0.2
+      stars.material.opacity = 0.05
+      bloom.strength = 0.2
+    } else {
+      skyMat.uniforms.uZenith.value.set(0x090d2f)
+      skyMat.uniforms.uMid.value.set(0x202a68)
+      skyMat.uniforms.uHorizon.value.set(0x4e4c78)
+      skyMat.uniforms.uSunStrength.value = 0
+      skySunDir.set(-0.65, 0.18, -0.75).normalize()
+      sun.position.set(-100, 10, -110)
+      sun.color.set(0x8395ff); sun.intensity = 0.18
+      ambient.color.set(0x4e5ca5); ambient.intensity = 0.2
+      hemisphere.color.set(0x5969b5); hemisphere.groundColor.set(0x101329); hemisphere.intensity = 0.16
+      snowGround.material.color.set(0x7890c0)
+      skyMat.uniforms.uCloudTint.value.set(0x747da7); skyMat.uniforms.uCloudStrength.value = 0.08
+      stars.material.opacity = 0.95
+      bloom.strength = 0.2
+    }
+    return timeNames[timeIndex]
+  }
+
+  return { camera, target, update, render, resize, toggleWeather, gust, setTime, getTime: () => timeNames[timeIndex] }
 }
 
 // ========== 卡通版场景 ==========
 function setupCartoon() {
   const scene = new THREE.Scene()
 
-  // 粉紫黄昏天空
-  scene.background = new THREE.Color(0x6a4a8c)
-  scene.fog = new THREE.FogExp2(0xffb58a, 0.008)
+  // 白天的卡通天空和冷色远景雾。
+  scene.background = new THREE.Color(0x8fd2f5)
+  scene.fog = new THREE.FogExp2(0xdff3ff, 0.006)
 
   const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000)
   camera.position.set(12, 6, 18)
 
   const target = new THREE.Vector3(0, 1.5, 0)
 
-  // 灯光：粉紫黄昏氛围
-  const sunLight = new THREE.DirectionalLight(0xffc49a, 1.2)
-  sunLight.position.set(-8, 10, 6)
+  // 灯光：清透的白天日光。
+  const sunLight = new THREE.DirectionalLight(0xfff4dc, 1.65)
+  sunLight.position.set(-6, 10, -10)
   sunLight.castShadow = true
+  sunLight.shadow.mapSize.set(2048, 2048)
+  sunLight.shadow.camera.near = 0.1
+  sunLight.shadow.camera.far = 80
+  sunLight.shadow.camera.left = -30
+  sunLight.shadow.camera.right = 30
+  sunLight.shadow.camera.top = 30
+  sunLight.shadow.camera.bottom = -30
+  sunLight.shadow.bias = -0.0002
+  sunLight.shadow.normalBias = 0.02
   scene.add(sunLight)
 
-  const backLight = new THREE.DirectionalLight(0xb888cc, 0.6)
+  const backLight = new THREE.DirectionalLight(0xb9e3ff, 0.5)
   backLight.position.set(6, 4, -8)
   scene.add(backLight)
 
-  const fillLight = new THREE.DirectionalLight(0xc8e0ff, 0.4)
+  const fillLight = new THREE.DirectionalLight(0xffffff, 0.65)
   fillLight.position.set(0, 8, 10)
   scene.add(fillLight)
 
-  const ambientLight = new THREE.AmbientLight(0x5a3a70, 0.45)
+  const ambientLight = new THREE.AmbientLight(0xd9f1ff, 0.7)
   scene.add(ambientLight)
 
-  const reflectLight = new THREE.PointLight(0xa8c8ff, 0.35, 30)
+  const reflectLight = new THREE.PointLight(0xffffff, 0.2, 30)
   reflectLight.position.set(0, 5, 0)
   scene.add(reflectLight)
 
-  // ========== 自然地平线橙红渐变光晕 ==========
+  // ========== 白天的柔和天空光晕 ==========
   const glowCanvas = document.createElement('canvas')
   glowCanvas.width = 1024
   glowCanvas.height = 512
@@ -471,29 +559,27 @@ function setupCartoon() {
   const gradientRadius = 400
 
   const grad1 = gCtx.createRadialGradient(centerX, centerY, 0, centerX, centerY, gradientRadius)
-  grad1.addColorStop(0, 'rgba(255, 180, 80, 0.4)')
-  grad1.addColorStop(0.1, 'rgba(255, 150, 60, 0.35)')
-  grad1.addColorStop(0.3, 'rgba(255, 120, 50, 0.25)')
-  grad1.addColorStop(0.5, 'rgba(255, 100, 40, 0.15)')
-  grad1.addColorStop(0.7, 'rgba(255, 80, 30, 0.08)')
-  grad1.addColorStop(1, 'rgba(255, 60, 20, 0)')
+  grad1.addColorStop(0, 'rgba(255, 255, 255, 0.22)')
+  grad1.addColorStop(0.25, 'rgba(230, 248, 255, 0.14)')
+  grad1.addColorStop(0.55, 'rgba(190, 230, 255, 0.07)')
+  grad1.addColorStop(1, 'rgba(150, 210, 255, 0)')
   gCtx.fillStyle = grad1
   gCtx.fillRect(0, 0, 1024, 512)
 
   const grad2 = gCtx.createRadialGradient(centerX, centerY + 50, 0, centerX, centerY + 50, 500)
-  grad2.addColorStop(0, 'rgba(255, 200, 100, 0.15)')
-  grad2.addColorStop(0.4, 'rgba(255, 160, 80, 0.1)')
-  grad2.addColorStop(0.7, 'rgba(255, 120, 60, 0.05)')
-  grad2.addColorStop(1, 'rgba(255, 80, 40, 0)')
+  grad2.addColorStop(0, 'rgba(255, 255, 255, 0.1)')
+  grad2.addColorStop(0.4, 'rgba(220, 245, 255, 0.07)')
+  grad2.addColorStop(0.7, 'rgba(180, 225, 255, 0.03)')
+  grad2.addColorStop(1, 'rgba(150, 210, 255, 0)')
   gCtx.fillStyle = grad2
   gCtx.fillRect(0, 0, 1024, 512)
 
   const grad3 = gCtx.createLinearGradient(0, 350, 0, 512)
-  grad3.addColorStop(0, 'rgba(255, 180, 80, 0)')
-  grad3.addColorStop(0.2, 'rgba(255, 150, 70, 0.12)')
-  grad3.addColorStop(0.5, 'rgba(255, 120, 50, 0.08)')
-  grad3.addColorStop(0.8, 'rgba(255, 100, 40, 0.04)')
-  grad3.addColorStop(1, 'rgba(255, 80, 30, 0)')
+  grad3.addColorStop(0, 'rgba(220, 248, 255, 0)')
+  grad3.addColorStop(0.2, 'rgba(210, 242, 255, 0.08)')
+  grad3.addColorStop(0.5, 'rgba(190, 232, 255, 0.05)')
+  grad3.addColorStop(0.8, 'rgba(170, 220, 255, 0.02)')
+  grad3.addColorStop(1, 'rgba(150, 210, 255, 0)')
   gCtx.fillStyle = grad3
   gCtx.fillRect(0, 0, 1024, 512)
 
@@ -503,8 +589,8 @@ function setupCartoon() {
     const radius = 30 + Math.random() * 150
     const spotGrad = gCtx.createRadialGradient(x, y, 0, x, y, radius)
     const alpha = 0.02 + Math.random() * 0.06
-    spotGrad.addColorStop(0, `rgba(255, 200, 100, ${alpha})`)
-    spotGrad.addColorStop(1, 'rgba(255, 200, 100, 0)')
+    spotGrad.addColorStop(0, `rgba(235, 250, 255, ${alpha})`)
+    spotGrad.addColorStop(1, 'rgba(210, 240, 255, 0)')
     gCtx.fillStyle = spotGrad
     gCtx.fillRect(x - radius, y - radius, radius * 2, radius * 2)
   }
@@ -532,10 +618,10 @@ function setupCartoon() {
   const rCtx = rayCanvas.getContext('2d')
 
   const rayGrad = rCtx.createLinearGradient(128, 0, 128, 256)
-  rayGrad.addColorStop(0, 'rgba(255, 200, 100, 0.15)')
-  rayGrad.addColorStop(0.3, 'rgba(255, 180, 80, 0.08)')
-  rayGrad.addColorStop(0.6, 'rgba(255, 150, 60, 0.03)')
-  rayGrad.addColorStop(1, 'rgba(255, 120, 40, 0)')
+  rayGrad.addColorStop(0, 'rgba(255, 255, 240, 0.12)')
+  rayGrad.addColorStop(0.3, 'rgba(240, 250, 255, 0.06)')
+  rayGrad.addColorStop(0.6, 'rgba(220, 245, 255, 0.025)')
+  rayGrad.addColorStop(1, 'rgba(210, 240, 255, 0)')
   rCtx.fillStyle = rayGrad
   rCtx.fillRect(0, 0, 256, 256)
 
@@ -546,7 +632,7 @@ function setupCartoon() {
     rCtx.beginPath()
     rCtx.moveTo(128, 128)
     rCtx.lineTo(x + Math.cos(angle) * 100, y + Math.sin(angle) * 80)
-    rCtx.strokeStyle = `rgba(255, 200, 100, ${0.02 + Math.random() * 0.03})`
+    rCtx.strokeStyle = `rgba(235, 250, 255, ${0.02 + Math.random() * 0.03})`
     rCtx.lineWidth = 8 + Math.random() * 20
     rCtx.stroke()
   }
@@ -568,21 +654,50 @@ function setupCartoon() {
   rayPlane.rotation.x = -0.1
   scene.add(rayPlane)
 
-  // ========== 清透冰面 ==========
+  // ========== 卡通白云 ==========
+  const cartoonClouds = []
+  const cartoonCloudGeo = new THREE.SphereGeometry(1, 12, 8)
+  const cartoonCloudLight = new THREE.MeshToonMaterial({ color: 0xffffff, transparent: true, opacity: 0.88 })
+  const cartoonCloudShade = new THREE.MeshToonMaterial({ color: 0xd9effa, transparent: true, opacity: 0.72 })
+  function createCartoonClouds() {
+    for (let i = 0; i < 10; i++) {
+      const cloud = new THREE.Group()
+      const puffs = 4 + Math.floor(Math.random() * 4)
+      for (let j = 0; j < puffs; j++) {
+        const puff = new THREE.Mesh(cartoonCloudGeo, j === 0 ? cartoonCloudShade : cartoonCloudLight)
+        const size = 0.8 + Math.random() * 1.25
+        puff.scale.set(size * (1.25 + Math.random() * 0.65), size * (0.45 + Math.random() * 0.35), size * (0.7 + Math.random() * 0.45))
+        puff.position.set((j - puffs * 0.5) * 1.25 + (Math.random() - 0.5) * 0.6, Math.random() * 0.7, (Math.random() - 0.5) * 1.2)
+        cloud.add(puff)
+      }
+      cloud.position.set((Math.random() - 0.5) * 34, 7 + Math.random() * 6, -12 - Math.random() * 15)
+      cloud.scale.setScalar(0.9 + Math.random() * 0.8)
+      cloud.userData = { baseX: cloud.position.x, baseY: cloud.position.y, speed: 0.08 + Math.random() * 0.08, phase: Math.random() * Math.PI * 2 }
+      scene.add(cloud)
+      cartoonClouds.push(cloud)
+    }
+  }
+  createCartoonClouds()
+
+  // 夜晚星空：卡通版使用大小略有变化的暖白星点，保持童话感。
+  const cartoonStarCount = 260
+  const cartoonStarPositions = new Float32Array(cartoonStarCount * 3)
+  for (let i = 0; i < cartoonStarCount; i++) {
+    cartoonStarPositions[i * 3] = (Math.random() - 0.5) * 70
+    cartoonStarPositions[i * 3 + 1] = 5 + Math.random() * 28
+    cartoonStarPositions[i * 3 + 2] = -18 - Math.random() * 35
+  }
+  const cartoonStarGeometry = new THREE.BufferGeometry()
+  cartoonStarGeometry.setAttribute('position', new THREE.BufferAttribute(cartoonStarPositions, 3))
+  const cartoonStars = new THREE.Points(cartoonStarGeometry, new THREE.PointsMaterial({ color: 0xfff4d0, size: 0.22, transparent: true, opacity: 0, depthWrite: false, sizeAttenuation: true }))
+  cartoonStars.frustumCulled = false
+  scene.add(cartoonStars)
+
+  // ========== 白色积雪地面 ==========
   const iceGeometry = new THREE.PlaneGeometry(24, 24)
-  const iceMaterial = new THREE.MeshPhysicalMaterial({
-    color: 0x99ccee,
-    emissive: 0x221133,
-    emissiveIntensity: 0.08,
-    roughness: 0.01,
-    metalness: 0.3,
-    transparent: true,
-    opacity: 0.7,
+  const iceMaterial = new THREE.MeshToonMaterial({
+    color: 0xffffff,
     side: THREE.DoubleSide,
-    clearcoat: 0.5,
-    clearcoatRoughness: 0.05,
-    ior: 1.33,
-    reflectivity: 0.9
   })
 
   const ice = new THREE.Mesh(iceGeometry, iceMaterial)
@@ -592,12 +707,8 @@ function setupCartoon() {
   scene.add(ice)
 
   const underIceGeometry = new THREE.PlaneGeometry(23.5, 23.5)
-  const underIceMaterial = new THREE.MeshPhysicalMaterial({
-    color: 0x6699cc,
-    roughness: 0.1,
-    metalness: 0.0,
-    transparent: true,
-    opacity: 0.25,
+  const underIceMaterial = new THREE.MeshToonMaterial({
+    color: 0xeaf7ff,
     side: THREE.DoubleSide
   })
 
@@ -610,8 +721,8 @@ function setupCartoon() {
   const sparkleGeometry = new THREE.CircleGeometry(0.04, 6)
   const sparkleMaterial = new THREE.MeshPhysicalMaterial({
     color: 0xffffff,
-    emissive: 0xaaddff,
-    emissiveIntensity: 1.0,
+    emissive: 0xffffff,
+    emissiveIntensity: 0.7,
     transparent: true,
     opacity: 0.6,
     side: THREE.DoubleSide
@@ -703,13 +814,17 @@ function setupCartoon() {
   // ========== 粉红色树木 ==========
   function createPinkTree(x, z) {
     const group = new THREE.Group()
-    const scale = 1.8 + Math.random() * 0.6
+    const scale = 1.65 + Math.random() * 0.85
+    const trunkWidth = 0.85 + Math.random() * 0.3
+    const lean = (Math.random() - 0.5) * 0.12
+    const crownDrift = (Math.random() - 0.5) * 0.18
 
     const trunk = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.2 * scale, 0.3 * scale, 0.8 * scale, 8),
+      new THREE.CylinderGeometry(0.2 * scale * trunkWidth, 0.3 * scale * trunkWidth, 0.8 * scale, 8),
       new THREE.MeshToonMaterial({ color: 0x5a3d2b })
     )
     trunk.position.y = 0.4 * scale
+    trunk.rotation.z = lean
     trunk.castShadow = true
     trunk.receiveShadow = true
     group.add(trunk)
@@ -721,8 +836,9 @@ function setupCartoon() {
       emissive: 0x552233,
       emissiveIntensity: 0.08
     })
-    const crown1 = new THREE.Mesh(new THREE.ConeGeometry(0.9 * scale, 0.7 * scale, 8), crownMat1)
-    crown1.position.y = 0.9 * scale
+    const crown1 = new THREE.Mesh(new THREE.ConeGeometry(0.9 * scale * (0.9 + Math.random() * 0.2), 0.7 * scale * (0.9 + Math.random() * 0.2), 8), crownMat1)
+    crown1.position.set(crownDrift, 0.9 * scale * (0.92 + Math.random() * 0.16), 0)
+    crown1.rotation.z = lean * 0.7
     crown1.castShadow = true
     crown1.receiveShadow = true
     group.add(crown1)
@@ -732,8 +848,9 @@ function setupCartoon() {
       emissive: 0x552233,
       emissiveIntensity: 0.06
     })
-    const crown2 = new THREE.Mesh(new THREE.ConeGeometry(0.7 * scale, 0.6 * scale, 8), crownMat2)
-    crown2.position.y = 1.4 * scale
+    const crown2 = new THREE.Mesh(new THREE.ConeGeometry(0.7 * scale * (0.88 + Math.random() * 0.24), 0.6 * scale * (0.9 + Math.random() * 0.2), 8), crownMat2)
+    crown2.position.set(crownDrift * 1.4 + (Math.random() - 0.5) * 0.12, 1.4 * scale * (0.92 + Math.random() * 0.16), (Math.random() - 0.5) * 0.12)
+    crown2.rotation.z = lean
     crown2.castShadow = true
     crown2.receiveShadow = true
     group.add(crown2)
@@ -743,8 +860,9 @@ function setupCartoon() {
       emissive: 0x552233,
       emissiveIntensity: 0.05
     })
-    const crown3 = new THREE.Mesh(new THREE.ConeGeometry(0.5 * scale, 0.5 * scale, 8), crownMat3)
-    crown3.position.y = 1.9 * scale
+    const crown3 = new THREE.Mesh(new THREE.ConeGeometry(0.5 * scale * (0.85 + Math.random() * 0.3), 0.5 * scale * (0.9 + Math.random() * 0.2), 8), crownMat3)
+    crown3.position.set(crownDrift * 1.8 + (Math.random() - 0.5) * 0.14, 1.9 * scale * (0.92 + Math.random() * 0.16), (Math.random() - 0.5) * 0.1)
+    crown3.rotation.z = lean * 1.2
     crown3.castShadow = true
     crown3.receiveShadow = true
     group.add(crown3)
@@ -754,11 +872,11 @@ function setupCartoon() {
         new THREE.ConeGeometry(0.15 * scale, 0.1 * scale, 6),
         new THREE.MeshToonMaterial({ color: 0xf5faff, transparent: true, opacity: 0.6 })
       )
-      snowCap.position.y = 2.2 * scale
+      snowCap.position.set(crownDrift * 1.8, 2.2 * scale, 0)
       group.add(snowCap)
     }
 
-    group.rotation.y = Math.random() * Math.PI * 2
+    group.rotation.set(0, Math.random() * Math.PI * 2, 0)
     group.position.set(x, 0, z)
     return group
   }
@@ -916,7 +1034,7 @@ function setupCartoon() {
   }
   glowGeometry.setAttribute('position', new THREE.BufferAttribute(glowPos, 3))
   const glowMat = new THREE.PointsMaterial({
-    color: 0xffaa66,
+    color: 0xdff5ff,
     size: 0.08,
     transparent: true,
     opacity: 0.25,
@@ -926,24 +1044,26 @@ function setupCartoon() {
   scene.add(glowPoints)
 
   // --- 太阳 ---
+  const cartoonSunMaterial = new THREE.MeshToonMaterial({
+    color: 0xfff1b0,
+    emissive: 0xffd56a,
+    emissiveIntensity: 0.45
+  })
   const sunMesh = new THREE.Mesh(
     new THREE.SphereGeometry(0.8, 16, 8),
-    new THREE.MeshToonMaterial({
-      color: 0xffaa55,
-      emissive: 0xff6622,
-      emissiveIntensity: 0.8
-    })
+    cartoonSunMaterial
   )
-  sunMesh.position.set(-6, 8, -10)
+  sunMesh.position.set(-6, 10, -10)
   scene.add(sunMesh)
 
+  const cartoonSunGlowMaterial = new THREE.MeshBasicMaterial({
+    color: 0xffe7a0,
+    transparent: true,
+    opacity: 0.08
+  })
   const glowSphere = new THREE.Mesh(
     new THREE.SphereGeometry(1.8, 8, 8),
-    new THREE.MeshBasicMaterial({
-      color: 0xff8844,
-      transparent: true,
-      opacity: 0.12
-    })
+    cartoonSunGlowMaterial
   )
   glowSphere.position.copy(sunMesh.position)
   scene.add(glowSphere)
@@ -991,7 +1111,75 @@ function setupCartoon() {
     }
   })
 
+  const timeNames = ['白天', '黄昏', '夜晚']
+  let timeIndex = 0
+  function setTime(next = (timeIndex + 1) % timeNames.length) {
+    timeIndex = next
+    if (timeIndex === 0) {
+      scene.background.set(0x8fd2f5)
+      scene.fog.color.set(0xdff3ff); scene.fog.density = 0.006
+      sunLight.color.set(0xfff4dc); sunLight.intensity = 1.65
+      backLight.color.set(0xb9e3ff); backLight.intensity = 0.5
+      fillLight.color.set(0xffffff); fillLight.intensity = 0.65
+      ambientLight.color.set(0xd9f1ff); ambientLight.intensity = 0.7
+      reflectLight.color.set(0xffffff); reflectLight.intensity = 0.2
+      sunLight.position.set(-6, 10, -10)
+      glowSphereMat.opacity = 0.9
+      glowSphereMat.color.set(0xffffff); rayPlane.material.color.set(0xffffff); rayPlane.material.opacity = 0.3
+      cartoonSunMaterial.color.set(0xfff1b0); cartoonSunMaterial.emissive.set(0xffd56a); cartoonSunMaterial.emissiveIntensity = 0.45
+      cartoonSunGlowMaterial.color.set(0xffe7a0); cartoonSunGlowMaterial.opacity = 0.08
+      cartoonCloudLight.color.set(0xffffff); cartoonCloudShade.color.set(0xd9effa); cartoonCloudLight.opacity = 0.88; cartoonCloudShade.opacity = 0.72
+      iceMaterial.color.set(0xffffff); underIceMaterial.color.set(0xeaf7ff); sparkleMaterial.emissive.set(0xffffff); sparkleMaterial.emissiveIntensity = 0.7
+      cartoonStars.material.opacity = 0
+    } else if (timeIndex === 1) {
+      scene.background.set(0xf0a27b)
+      scene.fog.color.set(0xf8c38b); scene.fog.density = 0.006
+      sunLight.position.set(-6, 2.2, -10)
+      sunLight.color.set(0xffae68); sunLight.intensity = 1.35
+      backLight.color.set(0x86609e); backLight.intensity = 0.52
+      fillLight.color.set(0xffd49a); fillLight.intensity = 0.42
+      ambientLight.color.set(0xb87578); ambientLight.intensity = 0.5
+      reflectLight.color.set(0xffbd7b); reflectLight.intensity = 0.24
+      glowSphereMat.opacity = 0.95
+      glowSphereMat.color.set(0xffb16d); rayPlane.material.color.set(0xffb16d); rayPlane.material.opacity = 0.46
+      cartoonSunMaterial.color.set(0xffb15c); cartoonSunMaterial.emissive.set(0xff6a2e); cartoonSunMaterial.emissiveIntensity = 0.75
+      cartoonSunGlowMaterial.color.set(0xff8148); cartoonSunGlowMaterial.opacity = 0.2
+      cartoonCloudLight.color.set(0xffd8bd); cartoonCloudShade.color.set(0x87536c); cartoonCloudLight.opacity = 0.75; cartoonCloudShade.opacity = 0.6
+      iceMaterial.color.set(0xffdfbd); underIceMaterial.color.set(0xdd9e91); sparkleMaterial.emissive.set(0xffcda0); sparkleMaterial.emissiveIntensity = 0.45
+      cartoonStars.material.opacity = 0.08
+    } else {
+      scene.background.set(0x11143f)
+      scene.fog.color.set(0x242452); scene.fog.density = 0.011
+      sunLight.position.set(-6, 1, -10)
+      sunLight.color.set(0x6574c7); sunLight.intensity = 0.22
+      backLight.color.set(0x5b4b9f); backLight.intensity = 0.38
+      fillLight.color.set(0x5369b3); fillLight.intensity = 0.18
+      ambientLight.color.set(0x313566); ambientLight.intensity = 0.38
+      reflectLight.color.set(0x697cff); reflectLight.intensity = 0.12
+      glowSphereMat.opacity = 0.35
+      glowSphereMat.color.set(0x7182d0); rayPlane.material.color.set(0x7182d0); rayPlane.material.opacity = 0.08
+      cartoonSunMaterial.color.set(0x555b99); cartoonSunMaterial.emissive.set(0x20245c); cartoonSunMaterial.emissiveIntensity = 0.15
+      cartoonSunGlowMaterial.color.set(0x4f5fb8); cartoonSunGlowMaterial.opacity = 0.05
+      cartoonCloudLight.color.set(0x59628e); cartoonCloudShade.color.set(0x292d55); cartoonCloudLight.opacity = 0.3; cartoonCloudShade.opacity = 0.22
+      iceMaterial.color.set(0x8095ca); underIceMaterial.color.set(0x4b5a91); sparkleMaterial.emissive.set(0x8da8ff); sparkleMaterial.emissiveIntensity = 0.75
+      cartoonStars.material.opacity = 1
+    }
+    if (timeIndex !== 2) {
+      const sunHeight = timeIndex === 0 ? 10 : 2.2
+      sunMesh.position.set(-6, sunHeight, -10)
+      glowSphere.position.copy(sunMesh.position)
+    }
+    sunMesh.visible = timeIndex !== 2
+    glowSphere.visible = timeIndex !== 2
+    return timeNames[timeIndex]
+  }
+
   function update(t) {
+    cartoonClouds.forEach(cloud => {
+      cloud.position.x = cloud.userData.baseX + Math.sin(t * cloud.userData.speed + cloud.userData.phase) * 1.8
+      cloud.position.y = cloud.userData.baseY + Math.sin(t * 0.35 + cloud.userData.phase) * 0.06
+    })
+
     // 雪花下落
     if (!snowStarted) {
       snowParticles.visible = false
@@ -1043,7 +1231,7 @@ function setupCartoon() {
   function render(){ renderer.render(scene, camera) }
   function resize(){ camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix() }
 
-  return { camera, target, update, render, resize, windButton }
+  return { camera, target, update, render, resize, windButton, setTime, getTime: () => timeNames[timeIndex] }
 }
 
 // ========== 编排：两个场景 + 切换 ==========
@@ -1117,8 +1305,14 @@ function makeActionBtn(text, bg, top){
 }
 const weatherBtn = makeActionBtn('🌨️ 天气开/关', '#7fb2e0', '30px')
 const realBtns = [weatherBtn]
+const timeBtn = makeActionBtn('🕒 时间：白天', '#536aa8', '82px')
 
 weatherBtn.addEventListener('click', ()=>{ if(mode==='real') real.toggleWeather() })
+timeBtn.addEventListener('click', () => {
+  const activeScene = mode === 'real' ? real : cartoon
+  const nextTime = activeScene.setTime()
+  timeBtn.textContent = `🕒 时间：${nextTime}`
+})
 
 // 交互提示（底部居中，9 秒后淡出）
 const hintEl = document.createElement('div')
@@ -1150,12 +1344,14 @@ toggleBtn.addEventListener('click', () => {
     renderer.toneMappingExposure = 1.0
     cartoon.windButton.style.display = 'block'
     realBtns.forEach(b => b.style.display = 'none')
+    timeBtn.textContent = `🕒 时间：${cartoon.getTime()}`
   } else {
     mode = 'real'
     toggleBtn.textContent = '🎨 切换到卡通版'
     renderer.toneMappingExposure = 1.0
     cartoon.windButton.style.display = 'none'
     realBtns.forEach(b => b.style.display = 'block')
+    timeBtn.textContent = `🕒 时间：${real.getTime()}`
   }
   applyControls(mode)
   state.mode = mode
